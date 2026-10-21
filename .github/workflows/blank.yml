@@ -1,0 +1,241 @@
+name: Kankor Pro - Extract, Test and Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Kankor-Pro-Merged-Admin-Center.zip"
+      - ".github/workflows/kankor-pro-auto-build.yml"
+  pull_request:
+    paths:
+      - "Kankor-Pro-Merged-Admin-Center.zip"
+      - ".github/workflows/kankor-pro-auto-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kankor-pro-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web-build:
+    name: Extract ZIP, install dependencies, test and build web app
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Locate and safely extract Kankor Pro ZIP
+        id: extract
+        run: |
+          set -euo pipefail
+          ARCHIVE="Kankor-Pro-Merged-Admin-Center.zip"
+          if [[ ! -f "$ARCHIVE" ]]; then
+            echo "::error::Missing $ARCHIVE. Upload the project ZIP to the repository root first."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/kankor-extracted"
+          python3 - "$ARCHIVE" "$RUNNER_TEMP/kankor-extracted" <<'PY'
+          import pathlib, sys, zipfile
+          archive = pathlib.Path(sys.argv[1])
+          destination = pathlib.Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as zf:
+              for member in zf.infolist():
+                  target = (destination / member.filename).resolve()
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(f"Unsafe ZIP path rejected: {member.filename}")
+              zf.extractall(destination)
+          print(f"Extracted {len(zf.infolist())} entries.")
+          PY
+
+          APP_ROOT="$RUNNER_TEMP/kankor-extracted/kankor-pro"
+          if [[ ! -f "$APP_ROOT/package.json" ]]; then
+            echo "::error::Expected kankor-pro/package.json was not found inside the ZIP."
+            find "$RUNNER_TEMP/kankor-extracted" -maxdepth 3 -type f | head -80
+            exit 1
+          fi
+          echo "app_root=$APP_ROOT" >> "$GITHUB_OUTPUT"
+          echo "Extracted project root: $APP_ROOT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ${{ runner.temp }}/kankor-extracted/kankor-pro/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: ${{ runner.temp }}/kankor-extracted/kankor-pro
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          elif [[ -f npm-shrinkwrap.json ]]; then
+            npm ci
+          elif [[ -f package.json ]]; then
+            echo "::warning::No npm lockfile found; installing from package.json with npm install."
+            npm install
+          else
+            echo "::error::No package.json found; cannot install web dependencies."
+            exit 1
+          fi
+
+      - name: Set up Python for admin tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ${{ runner.temp }}/kankor-extracted/kankor-pro/admin_desktop/requirements.txt
+
+      - name: Install admin dependencies
+        working-directory: ${{ runner.temp }}/kankor-extracted/kankor-pro/admin_desktop
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "::warning::admin_desktop/requirements.txt is absent; installing known test dependencies."
+            python -m pip install "cryptography>=43.0" "openpyxl>=3.1"
+          fi
+
+      - name: Test question-bank core
+        working-directory: ${{ runner.temp }}/kankor-extracted/kankor-pro/admin_desktop
+        run: |
+          set -euo pipefail
+          python -m compileall -q kankor_admin test_core.py
+          python test_core.py
+
+      - name: Validate question-bank content
+        working-directory: ${{ runner.temp }}/kankor-extracted/kankor-pro
+        run: |
+          set -euo pipefail
+          if [[ -f scripts/validate-content.mjs ]]; then
+            node scripts/validate-content.mjs
+          else
+            echo "::warning::Content validation script is absent; skipping this optional check."
+          fi
+
+      - name: Generate Prisma client when configured
+        working-directory: ${{ runner.temp }}/kankor-extracted/kankor-pro
+        env:
+          DATABASE_URL: "file:./db/custom.db"
+        run: |
+          set -euo pipefail
+          if [[ -f prisma/schema.prisma ]] && npm exec --no -- prisma --version >/dev/null 2>&1; then
+            npx prisma generate
+          else
+            echo "::notice::Prisma schema or CLI not present; skipping Prisma generation."
+          fi
+
+      - name: Build production web app
+        working-directory: ${{ runner.temp }}/kankor-extracted/kankor-pro
+        env:
+          DATABASE_URL: "file:./db/custom.db"
+          NEXTAUTH_SECRET: "ci-only-placeholder-not-for-production"
+          NEXTAUTH_URL: "http://localhost:3000"
+        run: |
+          set -euo pipefail
+          if npm run | grep -qE '^[[:space:]]+build'; then
+            npm run build
+          else
+            echo "::error::No build script is defined in package.json."
+            exit 1
+          fi
+
+      - name: Upload extracted source and web build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kankor-pro-web-build-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/kankor-extracted/kankor-pro
+            !${{ runner.temp }}/kankor-extracted/kankor-pro/node_modules
+            !${{ runner.temp }}/kankor-extracted/kankor-pro/.git
+            !${{ runner.temp }}/kankor-extracted/kankor-pro/.next/cache
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows-admin:
+    name: Build Windows Admin executable and run core tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Safely extract Kankor Pro ZIP
+        run: |
+          $archive = "Kankor-Pro-Merged-Admin-Center.zip"
+          if (!(Test-Path $archive)) {
+            Write-Error "Missing $archive. Upload the project ZIP to the repository root first."
+            exit 1
+          }
+          $dest = Join-Path $env:RUNNER_TEMP "kankor-extracted"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          @'
+          import pathlib, sys, zipfile
+          archive = pathlib.Path(sys.argv[1])
+          destination = pathlib.Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive) as zf:
+              for member in zf.infolist():
+                  target = (destination / member.filename).resolve()
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(f"Unsafe ZIP path rejected: {member.filename}")
+              zf.extractall(destination)
+              print(f"Extracted {len(zf.infolist())} entries.")
+          '@ | Set-Content -Encoding utf8 "$env:RUNNER_TEMP\safe_extract.py"
+          python "$env:RUNNER_TEMP\safe_extract.py" $archive $dest
+          $app = Join-Path $dest "kankor-pro"
+          if (!(Test-Path (Join-Path $app "admin_desktop\requirements.txt"))) {
+            Write-Error "Admin dependency file was not found inside the extracted ZIP."
+            exit 1
+          }
+          "APP_ROOT=$app" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install admin dependencies and packaging tool
+        working-directory: ${{ runner.temp }}\kankor-extracted\kankor-pro\admin_desktop
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Test admin core
+        working-directory: ${{ runner.temp }}\kankor-extracted\kankor-pro\admin_desktop
+        run: |
+          python -m compileall -q kankor_admin test_core.py
+          python test_core.py
+
+      - name: Build Windows GUI executable
+        working-directory: ${{ runner.temp }}\kankor-extracted\kankor-pro\admin_desktop
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir --name KankorProAdmin --paths . --collect-all PySide6 launcher.py
+          if (!(Test-Path "dist\KankorProAdmin\KankorProAdmin.exe")) {
+            Write-Error "PyInstaller completed without producing the expected executable."
+            exit 1
+          }
+
+      - name: Upload Windows Admin build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kankor-pro-windows-admin-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}\kankor-extracted\kankor-pro\admin_desktop\dist\KankorProAdmin
+            ${{ runner.temp }}\kankor-extracted\kankor-pro\admin_desktop\build
+          if-no-files-found: warn
+          retention-days: 14
